@@ -7,12 +7,10 @@ from PIL import Image
 from ultralytics import YOLO
 import cv2  # pip install opencv-python-headless
 
-# -----------------------------
-# Config
-# -----------------------------
-APP_TITLE = "VisionAssist - YOLO + CVD + Filter + Audio + Raw Color"
+APP_TITLE = "VisionAssist - YOLO + CVD + Audio + Raw Color"
 MODEL_PATH = "best.pt"
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
 
 # -----------------------------
 # Model
@@ -27,16 +25,19 @@ def load_model():
         )
     return YOLO(MODEL_PATH)
 
+
 # -----------------------------
-# Helpers
+# Utilities
 # -----------------------------
 def is_allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXTS
+
 
 def pil_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
     return buf.getvalue()
+
 
 def summarize_detections(detections: list[dict]) -> str:
     if not detections:
@@ -48,8 +49,9 @@ def summarize_detections(detections: list[dict]) -> str:
     parts = [f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
     return "Detected " + ", ".join(parts) + "."
 
+
 def make_tts_mp3(text: str) -> bytes | None:
-    """Uses gTTS (internet needed)."""
+    """gTTS requires internet."""
     try:
         from gtts import gTTS  # pip install gTTS
         buf = io.BytesIO()
@@ -58,22 +60,26 @@ def make_tts_mp3(text: str) -> bytes | None:
     except Exception:
         return None
 
+
 # -----------------------------
-# Raw image color detection (NO FILTER)
+# RAW COLOR DETECTION (NO FILTER, NO CVD)
 # -----------------------------
 def dominant_color_name_from_rgb(rgb: np.ndarray) -> tuple[str, tuple[int, int, int]]:
     """
-    Detect dominant color from RAW image (no filters applied).
-    Returns (color_name, (r,g,b)).
+    Detect dominant color from RAW image ONLY.
+    - No filters
+    - No CVD simulation
+    Returns: (color_name, (r,g,b))
     """
-    small = cv2.resize(rgb, (200, 200), interpolation=cv2.INTER_AREA)
+    # Resize for speed
+    small = cv2.resize(rgb, (220, 220), interpolation=cv2.INTER_AREA)
+
+    # Ignore near-black/near-white/low-saturation pixels (helps avoid background)
     hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
     h, s, v = cv2.split(hsv)
+    mask = (s > 45) & (v > 45) & (v < 245)
 
-    # Ignore low saturation / extreme dark/bright (background-ish)
-    mask = (s > 40) & (v > 40) & (v < 245)
     pixels = small[mask]
-
     if pixels.size == 0:
         avg = small.reshape(-1, 3).mean(axis=0)
         r, g, b = [int(x) for x in avg]
@@ -82,18 +88,18 @@ def dominant_color_name_from_rgb(rgb: np.ndarray) -> tuple[str, tuple[int, int, 
     avg = pixels.mean(axis=0)
     r, g, b = [int(x) for x in avg]
 
+    # Name color from HSV hue (OpenCV hue is 0..179)
     avg_rgb = np.uint8([[[r, g, b]]])
-    avg_hsv = cv2.cvtColor(avg_rgb, cv2.COLOR_RGB2HSV)[0, 0]
-    H, S, V = int(avg_hsv[0]), int(avg_hsv[1]), int(avg_hsv[2])
+    H, S, V = cv2.cvtColor(avg_rgb, cv2.COLOR_RGB2HSV)[0, 0]
 
     if S < 40:
         if V < 60:
             return ("Black", (r, g, b))
-        elif V > 200:
+        if V > 200:
             return ("White", (r, g, b))
-        else:
-            return ("Gray", (r, g, b))
+        return ("Gray", (r, g, b))
 
+    H = int(H)
     if H < 10 or H >= 170:
         name = "Red"
     elif 10 <= H < 25:
@@ -113,12 +119,13 @@ def dominant_color_name_from_rgb(rgb: np.ndarray) -> tuple[str, tuple[int, int, 
 
     return (name, (r, g, b))
 
-def rgb_swatch_png_bytes(rgb_tuple: tuple[int, int, int], size=60) -> bytes:
-    img = Image.new("RGB", (size, size), rgb_tuple)
-    return pil_to_bytes(img, fmt="PNG")
+
+def swatch_image(rgb_tuple: tuple[int, int, int], size=70) -> Image.Image:
+    return Image.new("RGB", (size, size), rgb_tuple)
+
 
 # -----------------------------
-# Filter (applies ONLY to annotated output)
+# Filter for annotated image only (optional)
 # -----------------------------
 def apply_filter_to_rgb(rgb: np.ndarray, mode: str,
                         h_min=0, s_min=0, v_min=0,
@@ -143,26 +150,25 @@ def apply_filter_to_rgb(rgb: np.ndarray, mode: str,
 
     return rgb
 
+
 # -----------------------------
-# CVD Simulation (applies to display output)
+# CVD Simulation (applies to displayed result only)
 # -----------------------------
 CVD_MATRICES = {
     "None": np.array([[1.0, 0.0, 0.0],
                       [0.0, 1.0, 0.0],
                       [0.0, 0.0, 1.0]], dtype=np.float32),
-
     "Protanopia": np.array([[0.56667, 0.43333, 0.00000],
                             [0.55833, 0.44167, 0.00000],
                             [0.00000, 0.24167, 0.75833]], dtype=np.float32),
-
     "Deuteranopia": np.array([[0.62500, 0.37500, 0.00000],
                               [0.70000, 0.30000, 0.00000],
                               [0.00000, 0.30000, 0.70000]], dtype=np.float32),
-
     "Tritanopia": np.array([[0.95000, 0.05000, 0.00000],
                             [0.00000, 0.43333, 0.56667],
                             [0.00000, 0.47500, 0.52500]], dtype=np.float32),
 }
+
 
 def apply_cvd_simulation(rgb: np.ndarray, cvd_type: str) -> np.ndarray:
     M = CVD_MATRICES.get(cvd_type, CVD_MATRICES["None"])
@@ -171,8 +177,9 @@ def apply_cvd_simulation(rgb: np.ndarray, cvd_type: str) -> np.ndarray:
     y = np.clip(y, 0.0, 1.0)
     return (y * 255.0).astype(np.uint8)
 
+
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -206,7 +213,7 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-# Get input image
+# Input image
 image_pil = None
 image_name = "camera.png"
 
@@ -230,23 +237,24 @@ else:
         st.stop()
     image_pil = Image.open(cam).convert("RGB")
 
-image_np = np.array(image_pil)
+image_np = np.array(image_pil)  # RAW image RGB
 
-# Raw color detection (NO FILTER)
+# ✅ RAW color detection (always from raw image_np only)
 color_name, avg_rgb = dominant_color_name_from_rgb(image_np)
 
 st.subheader("Raw Image Color Detection (No Filter)")
-cc1, cc2 = st.columns([1, 4])
-with cc1:
-    st.image(rgb_swatch_png_bytes(avg_rgb), caption=color_name, width=80)
-with cc2:
+rc1, rc2 = st.columns([1, 4])
+with rc1:
+    st.image(swatch_image(avg_rgb), caption=color_name, width=80)
+with rc2:
     st.write(f"**Dominant Color:** {color_name}")
     st.write(f"**Average RGB:** {avg_rgb}")
 
-# Main layout
+# Two-column UI
 col1, col2 = st.columns(2, gap="large")
+
 with col1:
-    st.subheader("Original")
+    st.subheader("Original (RAW)")
     st.image(image_pil, use_container_width=True)
 
 # YOLO inference
@@ -261,7 +269,7 @@ with st.spinner("Running YOLO inference..."):
 annotated_bgr = results[0].plot()
 annotated_rgb = annotated_bgr[..., ::-1]  # BGR->RGB
 
-# Detections list
+# Detections
 detections = []
 for b in results[0].boxes:
     x1, y1, x2, y2 = b.xyxy[0].tolist()
@@ -277,11 +285,9 @@ for b in results[0].boxes:
 with col2:
     st.subheader("Result (Annotated)")
 
-    # Display pipeline:
-    # 1) start with annotated result
+    # Display pipeline: annotated -> optional filter -> CVD
     display_rgb = annotated_rgb
 
-    # 2) optional FILTER (annotated only)
     if st.session_state.show_filter:
         display_rgb = apply_filter_to_rgb(
             display_rgb,
@@ -294,12 +300,10 @@ with col2:
             st.session_state.v_max,
         )
 
-    # 3) CVD simulation
     display_rgb = apply_cvd_simulation(display_rgb, cvd_type)
-
     st.image(Image.fromarray(display_rgb), use_container_width=True)
 
-    # Buttons under image
+    # Buttons
     bA, bB = st.columns(2)
     with bA:
         if st.button("Filter", key="btn_filter", use_container_width=True):
@@ -312,7 +316,7 @@ with col2:
             st.session_state.show_filter = False
             st.rerun()
 
-    # Filter options
+    # Filter panel (affects annotated image only)
     if st.session_state.show_filter:
         st.markdown("### Filter Options (Annotated only)")
         st.session_state.filter_mode = st.selectbox(
@@ -321,6 +325,7 @@ with col2:
             index=["none", "grayscale", "hsv_range"].index(st.session_state.filter_mode),
             key="filter_mode_select",
         )
+
         if st.session_state.filter_mode == "hsv_range":
             f1, f2, f3 = st.columns(3)
             with f1:
@@ -333,7 +338,7 @@ with col2:
                 st.session_state.v_min = st.slider("V min", 0, 255, st.session_state.v_min, key="vmin")
                 st.session_state.v_max = st.slider("V max", 0, 255, st.session_state.v_max, key="vmax")
 
-    # Audio
+    # Audio panel
     if st.session_state.play_audio:
         st.markdown("### Audio")
         summary = summarize_detections(detections)
@@ -344,7 +349,6 @@ with col2:
         else:
             st.audio(mp3, format="audio/mp3")
 
-# Detections + downloads
 st.subheader("Detections (JSON)")
 st.json(detections)
 
