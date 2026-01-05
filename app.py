@@ -1,95 +1,126 @@
-import os
-from flask import Flask, request, jsonify, render_template, send_from_directory
-from ultralytics import YOLO
-import cv2
-import numpy as np
-from PIL import Image
 import io
+import os
+from pathlib import Path
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads/'
-app.config['RESULT_FOLDER'] = 'results/'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs(app.config['RESULT_FOLDER'], exist_ok=True)
+import numpy as np
+import streamlit as st
+from PIL import Image
+from ultralytics import YOLO
 
-# Load your trained YOLOv11 model
-# Make sure your 'best.pt' file is in the same directory as app.py or provide the full path
+APP_TITLE = "YOLO Object Detection (Streamlit)"
+MODEL_PATH = "best.pt"
+ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+@st.cache_resource
+def load_model():
+    if not Path(MODEL_PATH).exists():
+        raise FileNotFoundError(
+            f"Model not found: {MODEL_PATH}\n"
+            "Put best.pt in the repo root (same folder as app.py), "
+            "or change MODEL_PATH."
+        )
+    return YOLO(MODEL_PATH)
+
+
+def is_allowed(filename: str) -> bool:
+    return Path(filename).suffix.lower() in ALLOWED_EXTS
+
+
+def pil_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+
+with st.sidebar:
+    st.header("Settings")
+    conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
+    iou_threshold = st.slider("IoU threshold", 0.0, 1.0, 0.45, 0.01)
+
+# Load model once
 try:
-    model = YOLO("best.pt")
-    print("YOLOv11 model loaded successfully.")
+    model = load_model()
 except Exception as e:
-    print(f"Error loading YOLOv11 model: {e}")
-    print("Please ensure 'best.pt' is in the current directory or provide the correct path.")
-    exit()
+    st.error(str(e))
+    st.stop()
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+uploaded = st.file_uploader(
+    "Upload an image",
+    type=[ext.replace(".", "") for ext in sorted(ALLOWED_EXTS)],
+)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image part in the request'}), 400
+if uploaded is None:
+    st.info("Upload an image to run detection.")
+    st.stop()
 
-    file = request.files['image']
+if not is_allowed(uploaded.name):
+    st.error(f"Unsupported file type. Allowed: {sorted(ALLOWED_EXTS)}")
+    st.stop()
 
-    if file.filename == '':
-        return jsonify({'error': 'No selected image'}), 400
+# Read image
+image = Image.open(uploaded).convert("RGB")
+image_np = np.array(image)
 
-    if file:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-        file.save(filepath)
+col1, col2 = st.columns(2, gap="large")
+with col1:
+    st.subheader("Original")
+    st.image(image, use_container_width=True)
 
-        try:
-            # Open the image using PIL to ensure it's in a format YOLO can handle
-            image = Image.open(filepath).convert("RGB")
-            image_np = np.array(image)
+# Run inference
+with st.spinner("Running YOLO inference..."):
+    results = model.predict(
+        source=image_np,
+        conf=conf_threshold,
+        iou=iou_threshold,
+        verbose=False,
+    )
 
-            # Perform inference
-            results = model(image_np)
+# Annotated image: Ultralytics plot returns BGR ndarray
+annotated_bgr = results[0].plot()
+annotated_rgb = annotated_bgr[..., ::-1]
+annotated_pil = Image.fromarray(annotated_rgb)
 
-            # Process and save the annotated image
-            annotated_image = results[0].plot() # This plots bounding boxes, labels, etc.
-            
-            # Convert annotated_image (NumPy array) to PIL Image for saving
-            annotated_image_pil = Image.fromarray(cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB))
-            
-            result_filename = f"result_{file.filename}"
-            result_filepath = os.path.join(app.config['RESULT_FOLDER'], result_filename)
-            annotated_image_pil.save(result_filepath)
+# Extract detections
+detections = []
+for b in results[0].boxes:
+    x1, y1, x2, y2 = b.xyxy[0].tolist()
+    conf = float(b.conf[0].item())
+    cls = int(b.cls[0].item())
+    detections.append(
+        {
+            "box": [x1, y1, x2, y2],
+            "confidence": conf,
+            "class_id": cls,
+            "class_name": model.names.get(cls, str(cls)),
+        }
+    )
 
-            # Prepare detection details
-            detections = []
-            for r in results[0].boxes:
-                x1, y1, x2, y2 = r.xyxy[0].tolist()
-                conf = r.conf[0].item()
-                cls = int(r.cls[0].item())
-                name = model.names[cls]
-                detections.append({
-                    "box": [x1, y1, x2, y2],
-                    "confidence": conf,
-                    "class_id": cls,
-                    "class_name": name
-                })
+with col2:
+    st.subheader("Result (Annotated)")
+    st.image(annotated_pil, use_container_width=True)
 
-            return jsonify({
-                'message': 'Image processed successfully',
-                'original_image': f'/uploads/{file.filename}',
-                'result_image': f'/results/{result_filename}',
-                'detections': detections
-            }), 200
+st.subheader("Detections (JSON)")
+st.json(detections)
 
-        except Exception as e:
-            print(f"Error during inference: {e}")
-            return jsonify({'error': f'Error processing image: {e}'}), 500
+# Downloads
+st.subheader("Download")
+annotated_bytes = pil_to_bytes(annotated_pil, fmt="PNG")
+st.download_button(
+    label="Download annotated image (PNG)",
+    data=annotated_bytes,
+    file_name=f"result_{Path(uploaded.name).stem}.png",
+    mime="image/png",
+)
 
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-@app.route('/results/<filename>')
-def result_file(filename):
-    return send_from_directory(app.config['RESULT_FOLDER'], filename)
-
-if __name__ == '__main__':
-   ## app.run(host='127.0.0.1', port=5000, debug=True)
+json_bytes = io.BytesIO()
+json_bytes.write(str(detections).encode("utf-8"))
+st.download_button(
+    label="Download detections (TXT/JSON-like)",
+    data=json_bytes.getvalue(),
+    file_name=f"detections_{Path(uploaded.name).stem}.txt",
+    mime="text/plain",
+)
