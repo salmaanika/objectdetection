@@ -1,3 +1,5 @@
+# python
+
 __pycache__/
 *.pyc
 .venv/
@@ -7,3 +9,21 @@ venv/
 *.ptl
 results/
 uploads/
+
+# Flutter build outputs
+flutter/build/
+flutter/.dart_tool/
+flutter/.flutter-plugins
+flutter/.flutter-plugins-dependencies
+
+# OS
+.DS_Store
+
+# Flutter build outputs
+flutter/build/
+flutter/.dart_tool/
+flutter/.flutter-plugins
+flutter/.flutter-plugins-dependencies
+
+# OS
+.DS_Store
