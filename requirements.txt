@@ -7,3 +7,4 @@ opencv-python-headless
 python-multipart[optional]
 numpy
 ultralytics
+streamlit
