@@ -1,0 +1,9 @@
+flask
+fastapi
+uvicorn
+torch
+pillow
+opencv-python-headless
+python-multipart[optional]
+numpy
+ultralytics
