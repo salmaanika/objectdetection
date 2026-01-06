@@ -2,6 +2,7 @@
 # VisionAssist - UML-aligned implementation (Class + Sequence Diagram names)
 # Pure RGB pipeline: YOLO uses PIL(RGB), color correction uses LMS, no HSV/BGR required.
 
+import hashlib
 import io
 import json
 import zipfile
@@ -79,15 +80,15 @@ def dominant_color_from_rgb(raw_rgb: np.ndarray) -> tuple[str, tuple[int, int, i
             name = "Gray"
         return name, (int(r), int(g), int(b))
 
-    # secondary colors
-    high = 160
-    low = 190
+    # secondary colors (simple heuristic)
+    strong = 160
+    not_strong = 190
 
-    if r > high and g > high and b < low:
+    if r > strong and g > strong and b < not_strong:
         name = "Yellow"
-    elif g > high and b > high and r < low:
+    elif g > strong and b > strong and r < not_strong:
         name = "Cyan"
-    elif r > high and b > high and g < low:
+    elif r > strong and b > strong and g < not_strong:
         name = "Magenta"
     else:
         if r >= g and r >= b:
@@ -100,6 +101,59 @@ def dominant_color_from_rgb(raw_rgb: np.ndarray) -> tuple[str, tuple[int, int, i
     return name, (int(r), int(g), int(b))
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# =============================
+# Streamlit-safe caches (IMPORTANT)
+# =============================
+@st.cache_resource
+def load_yolo_model(path: str) -> YOLO:
+    """Cache the heavy YOLO model resource. Safe because args are hashable (path string)."""
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"Model not found: {path}\n"
+            "Put best.pt in the repo root (or update MODEL_PATH)."
+        )
+    return YOLO(path)
+
+
+@st.cache_data(show_spinner=False)
+def yolo_infer_cached(
+    model_path: str,
+    image_bytes: bytes,
+    conf: float,
+    iou: float,
+) -> tuple[np.ndarray, list[dict]]:
+    """
+    Cache inference results so Filter/Audio reruns don't re-run YOLO.
+    Returns:
+      annotated_rgb (np.uint8 HxWx3),
+      detections (list[dict]) - JSON-serializable
+    """
+    model = load_yolo_model(model_path)
+
+    frame_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    results = model.predict(source=frame_pil, conf=conf, iou=iou, verbose=False)
+
+    annotated_rgb = np.array(results[0].plot(pil=True))
+
+    dets: list[dict] = []
+    for b in results[0].boxes:
+        cls = int(b.cls[0])
+        dets.append(
+            {
+                "box": b.xyxy[0].tolist(),
+                "confidence": float(b.conf[0]),
+                "class_id": cls,
+                "class_name": model.names.get(cls, str(cls)),
+            }
+        )
+
+    return annotated_rgb.astype(np.uint8), dets
+
+
 # =============================
 # ColorCorrectionEngine (UML)
 # =============================
@@ -109,25 +163,21 @@ class ColorCorrectionEngine:
     """
 
     # RGB -> LMS matrix and inverse
-    RGB_TO_LMS = np.array([
-        [0.31399, 0.63951, 0.04650],
-        [0.15537, 0.75789, 0.08670],
-        [0.01775, 0.10944, 0.87257],
-    ], dtype=np.float32)
-
+    RGB_TO_LMS = np.array(
+        [
+            [0.31399, 0.63951, 0.04650],
+            [0.15537, 0.75789, 0.08670],
+            [0.01775, 0.10944, 0.87257],
+        ],
+        dtype=np.float32,
+    )
     LMS_TO_RGB = np.linalg.inv(RGB_TO_LMS).astype(np.float32)
 
     LMS_MISSING = {
         "None": np.eye(3, dtype=np.float32),
-        "Protanopia": np.array([[0, 1, 0],
-                                [0, 1, 0],
-                                [0, 0, 1]], dtype=np.float32),
-        "Deuteranopia": np.array([[1, 0, 0],
-                                  [1, 0, 0],
-                                  [0, 0, 1]], dtype=np.float32),
-        "Tritanopia": np.array([[1, 0, 0],
-                                [0, 1, 0],
-                                [0, 1, 0]], dtype=np.float32),
+        "Protanopia": np.array([[0, 1, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32),
+        "Deuteranopia": np.array([[1, 0, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float32),
+        "Tritanopia": np.array([[1, 0, 0], [0, 1, 0], [0, 1, 0]], dtype=np.float32),
     }
 
     def applyCorrection(self, data: np.ndarray, cvd_type: str, intensity: float = 1.0) -> np.ndarray:
@@ -150,7 +200,6 @@ class ColorCorrectionEngine:
         if intensity >= 1:
             return corrected
 
-        # blend
         a = float(intensity)
         out = (data.astype(np.float32) * (1 - a) + corrected.astype(np.float32) * a)
         return np.clip(out, 0, 255).astype(np.uint8)
@@ -170,53 +219,20 @@ class ColorCorrectionEngine:
 class MachineLearningModel:
     """
     Wraps the YOLO model for detection and annotated image generation.
+    Uses Streamlit-safe caches (no caching on instance methods).
     """
 
     def __init__(self, mlModelPath: str):
         self.mlModelPath = mlModelPath
-        self.model = self.loadModel(mlModelPath)
+        # Keep a reference (and ensure model exists) but inference is cached separately:
+        self.model = load_yolo_model(mlModelPath)
 
-    @st.cache_resource
-    def loadModel(self, path: str) -> YOLO:
-        if not Path(path).exists():
-            raise FileNotFoundError(
-                f"Model not found: {path}\n"
-                "Put best.pt in the repo root."
-            )
-        return YOLO(path)
-
-    def classifyColor(self, frame_pil: Image.Image, conf: float, iou: float) -> Any:
+    def classifyColor(self, image_bytes: bytes, conf: float, iou: float) -> tuple[np.ndarray, list[dict]]:
         """
         In your diagram, 'classifyColor' is the ML step.
-        Here it returns YOLO results (detections), which include class labels.
+        Here it returns (annotated_rgb, detections) using cached inference.
         """
-        return self.model.predict(
-            source=frame_pil,  # PIL RGB to avoid BGR confusion
-            conf=conf,
-            iou=iou,
-            verbose=False
-        )
-
-    def getAnnotatedFrame(self, results: Any) -> np.ndarray:
-        """
-        Returns RGB annotated frame as numpy array.
-        """
-        return np.array(results[0].plot(pil=True))
-
-    def getDetections(self, results: Any) -> list[dict]:
-        """
-        Returns detections list for JSON/text output.
-        """
-        dets: list[dict] = []
-        for b in results[0].boxes:
-            cls = int(b.cls[0])
-            dets.append({
-                "box": b.xyxy[0].tolist(),
-                "confidence": float(b.conf[0]),
-                "class_id": cls,
-                "class_name": self.model.names.get(cls, str(cls)),
-            })
-        return dets
+        return yolo_infer_cached(self.mlModelPath, image_bytes, conf, iou)
 
 
 # =============================
@@ -243,6 +259,7 @@ class AudioFeedbackModule:
         """
         try:
             from gtts import gTTS  # pip install gTTS
+
             buf = io.BytesIO()
             gTTS(text=label, lang="en").write_to_fp(buf)
             return buf.getvalue()
@@ -331,9 +348,16 @@ def main():
         conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
         iou_threshold = st.slider("IoU threshold", 0.0, 1.0, 0.45, 0.01)
 
+        st.divider()
+        if st.button("Reload model / clear cache", use_container_width=True):
+            st.cache_resource.clear()
+            st.cache_data.clear()
+            st.rerun()
+
     # ---- Capture Frame (UserInterface captures frame)
     image_name = "camera.png"
     image_pil: Image.Image
+    image_bytes: bytes
 
     if source == "Upload Image":
         uploaded = st.file_uploader("Upload image", type=[e[1:] for e in ALLOWED_EXTS])
@@ -342,31 +366,37 @@ def main():
         if not is_allowed(uploaded.name):
             st.error(f"Unsupported file. Allowed: {sorted(ALLOWED_EXTS)}")
             st.stop()
+
         image_name = uploaded.name
-        image_pil = Image.open(uploaded).convert("RGB")
+        image_bytes = uploaded.getvalue()
+        image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     else:
         cam = st.camera_input("Capture image from camera")
         if not cam:
             st.stop()
+
         image_name = "camera.png"
-        image_pil = Image.open(cam).convert("RGB")
+        image_bytes = cam.getvalue()
+        image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     base = safe_stem(image_name)
 
     # raw frame as RGB numpy
-    raw_rgb = np.array(image_pil)
+    raw_rgb = np.array(image_pil).astype(np.uint8)
 
-    # ---- Raw dominant color (extra UX; not in UML boxes but OK)
+    # ---- Raw dominant color (extra UX)
     color_name, avg_rgb = dominant_color_from_rgb(raw_rgb)
     st.image(swatch_image(avg_rgb), width=80, caption=color_name)
     st.write(f"Average RGB: {avg_rgb}")
 
-    # ---- ML detection (UserInterface -> MachineLearningModel)
-    with st.spinner("Running YOLO inference..."):
-        results = ml.classifyColor(image_pil, conf_threshold, iou_threshold)
-
-    annotated_rgb = ml.getAnnotatedFrame(results)
-    detections = ml.getDetections(results)
+    # ---- ML detection (UserInterface -> MachineLearningModel) [CACHED]
+    try:
+        with st.spinner("Running YOLO inference... (cached when possible)"):
+            annotated_rgb, detections = ml.classifyColor(image_bytes, conf_threshold, iou_threshold)
+    except Exception as e:
+        st.error("YOLO inference failed.")
+        st.exception(e)
+        st.stop()
 
     # ---- Feedback text (MachineLearningModel -> FeedbackModule)
     text_label = feedback.generateTextLabel(detections)
@@ -415,10 +445,16 @@ def main():
     with col3:
         st.subheader("Filtered Images (CVD)")
         if ui.filterButtonState and ui.cvdType != "None":
-            st.image(Image.fromarray(filtered_original), caption=f"Filtered Original ({ui.cvdType})",
-                     use_container_width=True)
-            st.image(Image.fromarray(filtered_annotated), caption=f"Filtered Annotated ({ui.cvdType})",
-                     use_container_width=True)
+            st.image(
+                Image.fromarray(filtered_original),
+                caption=f"Filtered Original ({ui.cvdType})",
+                use_container_width=True,
+            )
+            st.image(
+                Image.fromarray(filtered_annotated),
+                caption=f"Filtered Annotated ({ui.cvdType})",
+                use_container_width=True,
+            )
         elif ui.filterButtonState and ui.cvdType == "None":
             st.info("Filter is ON, but CVD Type is None. Choose a CVD type.")
         else:
@@ -465,6 +501,7 @@ def main():
             file_name=filtered_img_name,
             mime="image/png",
         )
+        # NOTE: detections are from RAW inference (same content). Keep name if you want bundling symmetry.
         st.download_button(
             label=f"Download FILTERED detections (JSON) [{ui.cvdType}]",
             data=detections_json_bytes(detections),
@@ -475,10 +512,12 @@ def main():
     # ZIP bundles: image + json together
     st.markdown("#### Download ZIP (Image + JSON)")
 
-    raw_zip = make_zip_bytes([
-        (raw_img_name, pil_to_bytes(Image.fromarray(annotated_rgb), fmt="PNG")),
-        (raw_json_name, detections_json_bytes(detections)),
-    ])
+    raw_zip = make_zip_bytes(
+        [
+            (raw_img_name, pil_to_bytes(Image.fromarray(annotated_rgb), fmt="PNG")),
+            (raw_json_name, detections_json_bytes(detections)),
+        ]
+    )
     st.download_button(
         label="Download RAW ZIP",
         data=raw_zip,
@@ -489,10 +528,12 @@ def main():
     if ui.cvdType == "None":
         st.info("Filtered ZIP is disabled because CVD type is None.")
     else:
-        filtered_zip = make_zip_bytes([
-            (filtered_img_name, pil_to_bytes(Image.fromarray(filtered_annotated), fmt="PNG")),
-            (filtered_json_name, detections_json_bytes(detections)),
-        ])
+        filtered_zip = make_zip_bytes(
+            [
+                (filtered_img_name, pil_to_bytes(Image.fromarray(filtered_annotated), fmt="PNG")),
+                (filtered_json_name, detections_json_bytes(detections)),
+            ]
+        )
         st.download_button(
             label=f"Download FILTERED ZIP ({ui.cvdType})",
             data=filtered_zip,
