@@ -1,368 +1,505 @@
+# app.py
+# VisionAssist - UML-aligned implementation (Class + Sequence Diagram names)
+# Pure RGB pipeline: YOLO uses PIL(RGB), color correction uses LMS, no HSV/BGR required.
+
 import io
+import json
+import zipfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import streamlit as st
 from PIL import Image
 from ultralytics import YOLO
-import cv2  # pip install opencv-python-headless
 
-APP_TITLE = "VisionAssist - YOLO + CVD + Audio + Raw Color"
+APP_TITLE = "VisionAssist - YOLO + CVD Filter (Pure RGB, UML-Aligned)"
 MODEL_PATH = "best.pt"
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-# -----------------------------
-# Model
-# -----------------------------
-@st.cache_resource
-def load_model():
-    if not Path(MODEL_PATH).exists():
-        raise FileNotFoundError(
-            f"Model not found: {MODEL_PATH}\n"
-            "Put best.pt in the repo root (same folder as app.py), "
-            "or change MODEL_PATH."
-        )
-    return YOLO(MODEL_PATH)
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
+# =============================
+# Helpers (non-UML utilities)
+# =============================
 def is_allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXTS
 
 
-def pil_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
+def safe_stem(name: str) -> str:
+    stem = Path(name).stem if name else "image"
+    stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return stem or "image"
+
+
+def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
     return buf.getvalue()
 
 
-def summarize_detections(detections: list[dict]) -> str:
-    if not detections:
-        return "No objects detected."
-    counts = {}
-    for d in detections:
-        name = d["class_name"]
-        counts[name] = counts.get(name, 0) + 1
-    parts = [f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
-    return "Detected " + ", ".join(parts) + "."
+def detections_json_bytes(detections: list[dict]) -> bytes:
+    return (json.dumps(detections, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def make_tts_mp3(text: str) -> bytes | None:
-    """gTTS requires internet."""
-    try:
-        from gtts import gTTS  # pip install gTTS
-        buf = io.BytesIO()
-        gTTS(text=text, lang="en").write_to_fp(buf)
-        return buf.getvalue()
-    except Exception:
-        return None
+def make_zip_bytes(files: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fname, data in files:
+            zf.writestr(fname, data)
+    return buf.getvalue()
 
 
-# -----------------------------
-# RAW COLOR DETECTION (NO FILTER, NO CVD)
-# -----------------------------
-def dominant_color_name_from_rgb(rgb: np.ndarray) -> tuple[str, tuple[int, int, int]]:
+def cvd_suffix(cvd_type: str) -> str:
+    return "raw" if cvd_type == "None" else cvd_type.lower()
+
+
+def swatch_image(rgb: tuple[int, int, int], size: int = 70) -> Image.Image:
+    return Image.new("RGB", (size, size), rgb)
+
+
+def dominant_color_from_rgb(raw_rgb: np.ndarray) -> tuple[str, tuple[int, int, int]]:
     """
-    Detect dominant color from RAW image ONLY.
-    - No filters
-    - No CVD simulation
-    Returns: (color_name, (r,g,b))
+    RGB-only approximate dominant color name.
+    Detects: Red, Green, Blue, Yellow, Cyan, Magenta, White, Black, Gray.
     """
-    # Resize for speed
-    small = cv2.resize(rgb, (220, 220), interpolation=cv2.INTER_AREA)
+    avg = raw_rgb.reshape(-1, 3).mean(axis=0)
+    r, g, b = [float(x) for x in avg]
 
-    # Ignore near-black/near-white/low-saturation pixels (helps avoid background)
-    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-    h, s, v = cv2.split(hsv)
-    mask = (s > 45) & (v > 45) & (v < 245)
+    v = (r + g + b) / 3.0
+    mx = max(r, g, b)
+    mn = min(r, g, b)
 
-    pixels = small[mask]
-    if pixels.size == 0:
-        avg = small.reshape(-1, 3).mean(axis=0)
-        r, g, b = [int(x) for x in avg]
-        return ("Unknown", (r, g, b))
-
-    avg = pixels.mean(axis=0)
-    r, g, b = [int(x) for x in avg]
-
-    # Name color from HSV hue (OpenCV hue is 0..179)
-    avg_rgb = np.uint8([[[r, g, b]]])
-    H, S, V = cv2.cvtColor(avg_rgb, cv2.COLOR_RGB2HSV)[0, 0]
-
-    if S < 40:
-        if V < 60:
-            return ("Black", (r, g, b))
-        if V > 200:
-            return ("White", (r, g, b))
-        return ("Gray", (r, g, b))
-
-    H = int(H)
-    if H < 10 or H >= 170:
-        name = "Red"
-    elif 10 <= H < 25:
-        name = "Orange"
-    elif 25 <= H < 35:
-        name = "Yellow"
-    elif 35 <= H < 85:
-        name = "Green"
-    elif 85 <= H < 105:
-        name = "Cyan"
-    elif 105 <= H < 130:
-        name = "Blue"
-    elif 130 <= H < 170:
-        name = "Purple"
-    else:
-        name = "Unknown"
-
-    return (name, (r, g, b))
-
-
-def swatch_image(rgb_tuple: tuple[int, int, int], size=70) -> Image.Image:
-    return Image.new("RGB", (size, size), rgb_tuple)
-
-
-# -----------------------------
-# Filter for annotated image only (optional)
-# -----------------------------
-def apply_filter_to_rgb(rgb: np.ndarray, mode: str,
-                        h_min=0, s_min=0, v_min=0,
-                        h_max=179, s_max=255, v_max=255) -> np.ndarray:
-    if mode == "none":
-        return rgb
-
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-    if mode == "grayscale":
-        g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-        return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-
-    if mode == "hsv_range":
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
-        upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        filtered = cv2.bitwise_and(bgr, bgr, mask=mask)
-        return cv2.cvtColor(filtered, cv2.COLOR_BGR2RGB)
-
-    return rgb
-
-
-# -----------------------------
-# CVD Simulation (applies to displayed result only)
-# -----------------------------
-CVD_MATRICES = {
-    "None": np.array([[1.0, 0.0, 0.0],
-                      [0.0, 1.0, 0.0],
-                      [0.0, 0.0, 1.0]], dtype=np.float32),
-    "Protanopia": np.array([[0.56667, 0.43333, 0.00000],
-                            [0.55833, 0.44167, 0.00000],
-                            [0.00000, 0.24167, 0.75833]], dtype=np.float32),
-    "Deuteranopia": np.array([[0.62500, 0.37500, 0.00000],
-                              [0.70000, 0.30000, 0.00000],
-                              [0.00000, 0.30000, 0.70000]], dtype=np.float32),
-    "Tritanopia": np.array([[0.95000, 0.05000, 0.00000],
-                            [0.00000, 0.43333, 0.56667],
-                            [0.00000, 0.47500, 0.52500]], dtype=np.float32),
-}
-
-
-def apply_cvd_simulation(rgb: np.ndarray, cvd_type: str) -> np.ndarray:
-    M = CVD_MATRICES.get(cvd_type, CVD_MATRICES["None"])
-    x = rgb.astype(np.float32) / 255.0
-    y = x @ M.T
-    y = np.clip(y, 0.0, 1.0)
-    return (y * 255.0).astype(np.uint8)
-
-
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-
-# Session state defaults
-st.session_state.setdefault("show_filter", False)
-st.session_state.setdefault("play_audio", False)
-st.session_state.setdefault("filter_mode", "none")
-st.session_state.setdefault("h_min", 0)
-st.session_state.setdefault("s_min", 0)
-st.session_state.setdefault("v_min", 0)
-st.session_state.setdefault("h_max", 179)
-st.session_state.setdefault("s_max", 255)
-st.session_state.setdefault("v_max", 255)
-
-with st.sidebar:
-    st.header("Input Source")
-    source = st.radio("Choose input", ["Upload Image", "Live Camera"], index=0)
-
-    st.header("CVD Selection")
-    cvd_type = st.selectbox("Select CVD type", ["None", "Protanopia", "Deuteranopia", "Tritanopia"], index=0)
-
-    st.header("Detection Settings")
-    conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
-    iou_threshold = st.slider("IoU threshold", 0.0, 1.0, 0.45, 0.01)
-
-# Load model
-try:
-    model = load_model()
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-# Input image
-image_pil = None
-image_name = "camera.png"
-
-if source == "Upload Image":
-    uploaded = st.file_uploader(
-        "Upload an image",
-        type=[ext.replace(".", "") for ext in sorted(ALLOWED_EXTS)],
-    )
-    if uploaded is None:
-        st.info("Upload an image or switch to Live Camera.")
-        st.stop()
-    if not is_allowed(uploaded.name):
-        st.error(f"Unsupported file type. Allowed: {sorted(ALLOWED_EXTS)}")
-        st.stop()
-    image_name = uploaded.name
-    image_pil = Image.open(uploaded).convert("RGB")
-else:
-    cam = st.camera_input("Capture image from camera")
-    if cam is None:
-        st.info("Capture an image to run detection.")
-        st.stop()
-    image_pil = Image.open(cam).convert("RGB")
-
-image_np = np.array(image_pil)  # RAW image RGB
-
-# ✅ RAW color detection (always from raw image_np only)
-color_name, avg_rgb = dominant_color_name_from_rgb(image_np)
-
-st.subheader("Raw Image Color Detection (No Filter)")
-rc1, rc2 = st.columns([1, 4])
-with rc1:
-    st.image(swatch_image(avg_rgb), caption=color_name, width=80)
-with rc2:
-    st.write(f"**Dominant Color:** {color_name}")
-    st.write(f"**Average RGB:** {avg_rgb}")
-
-# Two-column UI
-col1, col2 = st.columns(2, gap="large")
-
-with col1:
-    st.subheader("Original (RAW)")
-    st.image(image_pil, use_container_width=True)
-
-# YOLO inference
-with st.spinner("Running YOLO inference..."):
-    results = model.predict(
-        source=image_np,
-        conf=conf_threshold,
-        iou=iou_threshold,
-        verbose=False,
-    )
-
-annotated_bgr = results[0].plot()
-annotated_rgb = annotated_bgr[..., ::-1]  # BGR->RGB
-
-# Detections
-detections = []
-for b in results[0].boxes:
-    x1, y1, x2, y2 = b.xyxy[0].tolist()
-    conf = float(b.conf[0].item())
-    cls = int(b.cls[0].item())
-    detections.append({
-        "box": [x1, y1, x2, y2],
-        "confidence": conf,
-        "class_id": cls,
-        "class_name": model.names.get(cls, str(cls)),
-    })
-
-with col2:
-    st.subheader("Result (Annotated)")
-
-    # Display pipeline: annotated -> optional filter -> CVD
-    display_rgb = annotated_rgb
-
-    if st.session_state.show_filter:
-        display_rgb = apply_filter_to_rgb(
-            display_rgb,
-            st.session_state.filter_mode,
-            st.session_state.h_min,
-            st.session_state.s_min,
-            st.session_state.v_min,
-            st.session_state.h_max,
-            st.session_state.s_max,
-            st.session_state.v_max,
-        )
-
-    display_rgb = apply_cvd_simulation(display_rgb, cvd_type)
-    st.image(Image.fromarray(display_rgb), use_container_width=True)
-
-    # Buttons
-    bA, bB = st.columns(2)
-    with bA:
-        if st.button("Filter", key="btn_filter", use_container_width=True):
-            st.session_state.show_filter = not st.session_state.show_filter
-            st.session_state.play_audio = False
-            st.rerun()
-    with bB:
-        if st.button("Audio", key="btn_audio", use_container_width=True):
-            st.session_state.play_audio = not st.session_state.play_audio
-            st.session_state.show_filter = False
-            st.rerun()
-
-    # Filter panel (affects annotated image only)
-    if st.session_state.show_filter:
-        st.markdown("### Filter Options (Annotated only)")
-        st.session_state.filter_mode = st.selectbox(
-            "Filter mode",
-            ["none", "grayscale", "hsv_range"],
-            index=["none", "grayscale", "hsv_range"].index(st.session_state.filter_mode),
-            key="filter_mode_select",
-        )
-
-        if st.session_state.filter_mode == "hsv_range":
-            f1, f2, f3 = st.columns(3)
-            with f1:
-                st.session_state.h_min = st.slider("H min", 0, 179, st.session_state.h_min, key="hmin")
-                st.session_state.h_max = st.slider("H max", 0, 179, st.session_state.h_max, key="hmax")
-            with f2:
-                st.session_state.s_min = st.slider("S min", 0, 255, st.session_state.s_min, key="smin")
-                st.session_state.s_max = st.slider("S max", 0, 255, st.session_state.s_max, key="smax")
-            with f3:
-                st.session_state.v_min = st.slider("V min", 0, 255, st.session_state.v_min, key="vmin")
-                st.session_state.v_max = st.slider("V max", 0, 255, st.session_state.v_max, key="vmax")
-
-    # Audio panel
-    if st.session_state.play_audio:
-        st.markdown("### Audio")
-        summary = summarize_detections(detections)
-        st.write(summary)
-        mp3 = make_tts_mp3(summary)
-        if mp3 is None:
-            st.warning("Audio not available. Install gTTS: `pip install gTTS` (needs internet).")
+    # low chroma -> gray scale
+    if (mx - mn) < 18:
+        if v < 50:
+            name = "Black"
+        elif v > 210:
+            name = "White"
         else:
-            st.audio(mp3, format="audio/mp3")
+            name = "Gray"
+        return name, (int(r), int(g), int(b))
 
-st.subheader("Detections (JSON)")
-st.json(detections)
+    # secondary colors
+    high = 160
+    low = 190
 
-st.subheader("Download")
-st.download_button(
-    label="Download displayed image (PNG)",
-    data=pil_to_bytes(Image.fromarray(display_rgb), fmt="PNG"),
-    file_name=f"result_{Path(image_name).stem}.png",
-    mime="image/png",
-)
+    if r > high and g > high and b < low:
+        name = "Yellow"
+    elif g > high and b > high and r < low:
+        name = "Cyan"
+    elif r > high and b > high and g < low:
+        name = "Magenta"
+    else:
+        if r >= g and r >= b:
+            name = "Red"
+        elif g >= r and g >= b:
+            name = "Green"
+        else:
+            name = "Blue"
 
-st.download_button(
-    label="Download detections (TXT/JSON-like)",
-    data=str(detections).encode("utf-8"),
-    file_name=f"detections_{Path(image_name).stem}.txt",
-    mime="text/plain",
-)
+    return name, (int(r), int(g), int(b))
+
+
+# =============================
+# ColorCorrectionEngine (UML)
+# =============================
+class ColorCorrectionEngine:
+    """
+    Applies CVD simulation/correction using LMS missing-cone matrices.
+    """
+
+    # RGB -> LMS matrix and inverse
+    RGB_TO_LMS = np.array([
+        [0.31399, 0.63951, 0.04650],
+        [0.15537, 0.75789, 0.08670],
+        [0.01775, 0.10944, 0.87257],
+    ], dtype=np.float32)
+
+    LMS_TO_RGB = np.linalg.inv(RGB_TO_LMS).astype(np.float32)
+
+    LMS_MISSING = {
+        "None": np.eye(3, dtype=np.float32),
+        "Protanopia": np.array([[0, 1, 0],
+                                [0, 1, 0],
+                                [0, 0, 1]], dtype=np.float32),
+        "Deuteranopia": np.array([[1, 0, 0],
+                                  [1, 0, 0],
+                                  [0, 0, 1]], dtype=np.float32),
+        "Tritanopia": np.array([[1, 0, 0],
+                                [0, 1, 0],
+                                [0, 1, 0]], dtype=np.float32),
+    }
+
+    def applyCorrection(self, data: np.ndarray, cvd_type: str, intensity: float = 1.0) -> np.ndarray:
+        """
+        UML-like signature:
+          applyCorrection(data: RawColorData, type: String, intensity: Double): CorrectedData
+
+        Notes:
+        - intensity blends between original and corrected:
+            intensity=0 => original
+            intensity=1 => fully corrected
+        """
+        cvd_type = cvd_type if cvd_type in self.LMS_MISSING else "None"
+
+        if cvd_type == "None" or intensity <= 0:
+            return data
+
+        corrected = self._apply_cvd(data, cvd_type)
+
+        if intensity >= 1:
+            return corrected
+
+        # blend
+        a = float(intensity)
+        out = (data.astype(np.float32) * (1 - a) + corrected.astype(np.float32) * a)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _apply_cvd(self, rgb: np.ndarray, cvd_type: str) -> np.ndarray:
+        M = self.LMS_MISSING[cvd_type]
+        x = rgb.astype(np.float32) / 255.0
+        lms = x @ self.RGB_TO_LMS.T
+        lms = lms @ M.T
+        rgb2 = lms @ self.LMS_TO_RGB.T
+        return (np.clip(rgb2, 0, 1) * 255).astype(np.uint8)
+
+
+# =============================
+# MachineLearningModel (UML)
+# =============================
+class MachineLearningModel:
+    """
+    Wraps the YOLO model for detection and annotated image generation.
+    """
+
+    def __init__(self, mlModelPath: str):
+        self.mlModelPath = mlModelPath
+        self.model = self.loadModel(mlModelPath)
+
+    @st.cache_resource
+    def loadModel(self, path: str) -> YOLO:
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"Model not found: {path}\n"
+                "Put best.pt in the repo root."
+            )
+        return YOLO(path)
+
+    def classifyColor(self, frame_pil: Image.Image, conf: float, iou: float) -> Any:
+        """
+        In your diagram, 'classifyColor' is the ML step.
+        Here it returns YOLO results (detections), which include class labels.
+        """
+        return self.model.predict(
+            source=frame_pil,  # PIL RGB to avoid BGR confusion
+            conf=conf,
+            iou=iou,
+            verbose=False
+        )
+
+    def getAnnotatedFrame(self, results: Any) -> np.ndarray:
+        """
+        Returns RGB annotated frame as numpy array.
+        """
+        return np.array(results[0].plot(pil=True))
+
+    def getDetections(self, results: Any) -> list[dict]:
+        """
+        Returns detections list for JSON/text output.
+        """
+        dets: list[dict] = []
+        for b in results[0].boxes:
+            cls = int(b.cls[0])
+            dets.append({
+                "box": b.xyxy[0].tolist(),
+                "confidence": float(b.conf[0]),
+                "class_id": cls,
+                "class_name": self.model.names.get(cls, str(cls)),
+            })
+        return dets
+
+
+# =============================
+# FeedbackModule (UML) - Text
+# =============================
+class FeedbackModule:
+    def generateTextLabel(self, detections: list[dict]) -> str:
+        if not detections:
+            return "No objects detected."
+        counts: dict[str, int] = {}
+        for d in detections:
+            counts[d["class_name"]] = counts.get(d["class_name"], 0) + 1
+        parts = [f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+        return "Detected " + ", ".join(parts) + "."
+
+
+# =============================
+# AudioFeedbackModule (UML)
+# =============================
+class AudioFeedbackModule:
+    def generateAudio(self, label: str) -> bytes | None:
+        """
+        Uses gTTS (requires internet in many environments).
+        """
+        try:
+            from gtts import gTTS  # pip install gTTS
+            buf = io.BytesIO()
+            gTTS(text=label, lang="en").write_to_fp(buf)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+
+# =============================
+# UserInterface (UML) - Streamlit Controller
+# =============================
+class UserInterface:
+    """
+    Manages Streamlit state and rendering.
+    """
+
+    def __init__(self):
+        st.session_state.setdefault("filterButtonState", False)
+        st.session_state.setdefault("playAudioState", False)
+        st.session_state.setdefault("cvdType", "None")
+        st.session_state.setdefault("cvdIntensity", 1.0)
+
+    @property
+    def filterButtonState(self) -> bool:
+        return bool(st.session_state.get("filterButtonState", False))
+
+    @property
+    def playAudioState(self) -> bool:
+        return bool(st.session_state.get("playAudioState", False))
+
+    @property
+    def cvdType(self) -> str:
+        return str(st.session_state.get("cvdType", "None"))
+
+    @property
+    def cvdIntensity(self) -> float:
+        return float(st.session_state.get("cvdIntensity", 1.0))
+
+    def selectCVDType(self, cvd_type: str):
+        st.session_state["cvdType"] = cvd_type
+
+    def setCVDIntensity(self, intensity: float):
+        st.session_state["cvdIntensity"] = float(intensity)
+
+    def toggleFilters(self):
+        st.session_state["filterButtonState"] = not self.filterButtonState
+        # optional: when filter toggles, stop audio
+        st.session_state["playAudioState"] = False
+
+    def toggleAudio(self):
+        st.session_state["playAudioState"] = not self.playAudioState
+
+    def displayOutput(self, title: str, image_rgb: np.ndarray, label: str | None = None):
+        st.subheader(title)
+        st.image(Image.fromarray(image_rgb), use_container_width=True)
+        if label:
+            st.write(label)
+
+
+# =============================
+# App wiring (matches Sequence Diagram flow)
+# =============================
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+
+    ui = UserInterface()
+    color_engine = ColorCorrectionEngine()
+    ml = MachineLearningModel(MODEL_PATH)
+    feedback = FeedbackModule()
+    audio_feedback = AudioFeedbackModule()
+
+    # ---- Sidebar: Configure CVD Type, thresholds (User -> UserInterface)
+    with st.sidebar:
+        st.header("Input Source")
+        source = st.radio("Choose input", ["Upload Image", "Live Camera"], index=0)
+
+        st.header("CVD Type")
+        cvd_type = st.selectbox("Select CVD type", ["None", "Protanopia", "Deuteranopia", "Tritanopia"], index=0)
+        ui.selectCVDType(cvd_type)
+
+        st.header("CVD Intensity")
+        intensity = st.slider("Intensity", 0.0, 1.0, float(ui.cvdIntensity), 0.05)
+        ui.setCVDIntensity(float(intensity))
+
+        st.header("Detection Settings")
+        conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
+        iou_threshold = st.slider("IoU threshold", 0.0, 1.0, 0.45, 0.01)
+
+    # ---- Capture Frame (UserInterface captures frame)
+    image_name = "camera.png"
+    image_pil: Image.Image
+
+    if source == "Upload Image":
+        uploaded = st.file_uploader("Upload image", type=[e[1:] for e in ALLOWED_EXTS])
+        if not uploaded:
+            st.stop()
+        if not is_allowed(uploaded.name):
+            st.error(f"Unsupported file. Allowed: {sorted(ALLOWED_EXTS)}")
+            st.stop()
+        image_name = uploaded.name
+        image_pil = Image.open(uploaded).convert("RGB")
+    else:
+        cam = st.camera_input("Capture image from camera")
+        if not cam:
+            st.stop()
+        image_name = "camera.png"
+        image_pil = Image.open(cam).convert("RGB")
+
+    base = safe_stem(image_name)
+
+    # raw frame as RGB numpy
+    raw_rgb = np.array(image_pil)
+
+    # ---- Raw dominant color (extra UX; not in UML boxes but OK)
+    color_name, avg_rgb = dominant_color_from_rgb(raw_rgb)
+    st.image(swatch_image(avg_rgb), width=80, caption=color_name)
+    st.write(f"Average RGB: {avg_rgb}")
+
+    # ---- ML detection (UserInterface -> MachineLearningModel)
+    with st.spinner("Running YOLO inference..."):
+        results = ml.classifyColor(image_pil, conf_threshold, iou_threshold)
+
+    annotated_rgb = ml.getAnnotatedFrame(results)
+    detections = ml.getDetections(results)
+
+    # ---- Feedback text (MachineLearningModel -> FeedbackModule)
+    text_label = feedback.generateTextLabel(detections)
+
+    # ---- Buttons (Filter/Audio) under the middle panel
+    col1, col2, col3 = st.columns(3, gap="large")
+
+    with col2:
+        btnA, btnB = st.columns(2)
+        with btnA:
+            if st.button("Filter", use_container_width=True):
+                ui.toggleFilters()
+                st.rerun()
+        with btnB:
+            if st.button("Audio", use_container_width=True):
+                ui.toggleAudio()
+                st.rerun()
+
+    # ---- Apply ColorCorrectionEngine ONLY when filter is ON
+    if ui.filterButtonState and ui.cvdType != "None":
+        filtered_original = color_engine.applyCorrection(raw_rgb, ui.cvdType, ui.cvdIntensity)
+        filtered_annotated = color_engine.applyCorrection(annotated_rgb, ui.cvdType, ui.cvdIntensity)
+    else:
+        filtered_original = raw_rgb
+        filtered_annotated = annotated_rgb
+
+    # ---- Audio feedback module only when Audio is ON
+    audio_mp3 = None
+    if ui.playAudioState:
+        audio_mp3 = audio_feedback.generateAudio(text_label)
+
+    # ---- Display Output (UserInterface -> User)
+    with col1:
+        ui.displayOutput("Original (RAW)", raw_rgb)
+
+    with col2:
+        ui.displayOutput("Result (Annotated - RAW)", annotated_rgb, label=text_label)
+
+        if ui.playAudioState:
+            st.markdown("### Audio")
+            if audio_mp3 is None:
+                st.warning("Audio not available. Install gTTS and ensure internet access.")
+            else:
+                st.audio(audio_mp3, format="audio/mp3")
+
+    with col3:
+        st.subheader("Filtered Images (CVD)")
+        if ui.filterButtonState and ui.cvdType != "None":
+            st.image(Image.fromarray(filtered_original), caption=f"Filtered Original ({ui.cvdType})",
+                     use_container_width=True)
+            st.image(Image.fromarray(filtered_annotated), caption=f"Filtered Annotated ({ui.cvdType})",
+                     use_container_width=True)
+        elif ui.filterButtonState and ui.cvdType == "None":
+            st.info("Filter is ON, but CVD Type is None. Choose a CVD type.")
+        else:
+            st.info("Press Filter to view CVD images")
+
+    # ---- JSON output
+    st.subheader("Detections (JSON)")
+    st.json(detections)
+
+    # ---- Downloads (RAW vs FILTERED + ZIP + auto naming)
+    st.subheader("Download")
+
+    suffix = cvd_suffix(ui.cvdType)
+
+    raw_img_name = f"{base}_annotated_raw.png"
+    raw_json_name = f"{base}_detections_raw.json"
+
+    filtered_img_name = f"{base}_annotated_{suffix}.png"
+    filtered_json_name = f"{base}_detections_{suffix}.json"
+
+    # Separate downloads: RAW
+    st.markdown("#### Download RAW")
+    st.download_button(
+        label="Download RAW annotated image (PNG)",
+        data=pil_to_bytes(Image.fromarray(annotated_rgb), fmt="PNG"),
+        file_name=raw_img_name,
+        mime="image/png",
+    )
+    st.download_button(
+        label="Download RAW detections (JSON)",
+        data=detections_json_bytes(detections),
+        file_name=raw_json_name,
+        mime="application/json",
+    )
+
+    # Separate downloads: FILTERED
+    st.markdown("#### Download FILTERED")
+    if ui.cvdType == "None":
+        st.info("Choose a CVD type (Protanopia/Deuteranopia/Tritanopia) to enable filtered downloads.")
+    else:
+        st.download_button(
+            label=f"Download FILTERED annotated image (PNG) [{ui.cvdType}]",
+            data=pil_to_bytes(Image.fromarray(filtered_annotated), fmt="PNG"),
+            file_name=filtered_img_name,
+            mime="image/png",
+        )
+        st.download_button(
+            label=f"Download FILTERED detections (JSON) [{ui.cvdType}]",
+            data=detections_json_bytes(detections),
+            file_name=filtered_json_name,
+            mime="application/json",
+        )
+
+    # ZIP bundles: image + json together
+    st.markdown("#### Download ZIP (Image + JSON)")
+
+    raw_zip = make_zip_bytes([
+        (raw_img_name, pil_to_bytes(Image.fromarray(annotated_rgb), fmt="PNG")),
+        (raw_json_name, detections_json_bytes(detections)),
+    ])
+    st.download_button(
+        label="Download RAW ZIP",
+        data=raw_zip,
+        file_name=f"{base}_raw_bundle.zip",
+        mime="application/zip",
+    )
+
+    if ui.cvdType == "None":
+        st.info("Filtered ZIP is disabled because CVD type is None.")
+    else:
+        filtered_zip = make_zip_bytes([
+            (filtered_img_name, pil_to_bytes(Image.fromarray(filtered_annotated), fmt="PNG")),
+            (filtered_json_name, detections_json_bytes(detections)),
+        ])
+        st.download_button(
+            label=f"Download FILTERED ZIP ({ui.cvdType})",
+            data=filtered_zip,
+            file_name=f"{base}_{suffix}_bundle.zip",
+            mime="application/zip",
+        )
+
+
+if __name__ == "__main__":
+    main()
